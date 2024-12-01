@@ -17,7 +17,6 @@ import org.apache.zookeeper.*;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.KeeperException.*;
 import org.apache.zookeeper.data.*;
-import org.apache.zookeeper.KeeperException.Code;
 import org.apache.zookeeper.AsyncCallback.StringCallback;
 import org.apache.zookeeper.AsyncCallback.ChildrenCallback;
 import org.apache.zookeeper.AsyncCallback.DataCallback;
@@ -38,6 +37,9 @@ import java.nio.charset.StandardCharsets;
 //		you manage the code more modularly.
 //	REMEMBER !! Managers and Workers are also clients of ZK and the ZK client library is single thread - Watches & CallBacks should not be used for time consuming tasks.
 //		In particular, if the process is a worker, Watches & CallBacks should only be used to assign the "work" to a separate thread inside your program.
+
+
+// Apache ZooKeeper documentation for easy access: https://zookeeper.apache.org/doc/r3.3.3/api/org/apache/zookeeper/ZooKeeper.html
 public class DistProcess implements Watcher
 {
 	ZooKeeper zk;
@@ -151,7 +153,7 @@ public class DistProcess implements Watcher
 
 	DataCallback getDataCallback = new DataCallback() {
 		public void processResult(int rc, String path, Object ctx, byte[] data, Stat stat)  {
-			myTaskObj taskObj = new myTaskObj(path, (String) ctx, data);
+			myTaskObj taskObj = new myTaskObj((String) ctx, data);
 			zk.getChildren("/dist20/workers", idleWorkerWatcher, workersGetChildrenCallback, taskObj);
 		}
 	};
@@ -236,13 +238,11 @@ public class DistProcess implements Watcher
 
 		// Custom task object used to store task details. Useful when recreating a task is required
 		class myTaskObj {
-			String path;
-			String task;
 			byte[] data;
+			String task;
 			String workerName = null;
 			String workerPath = null;
-			myTaskObj(String path, String task, byte[] data) {
-				this.path = path;
+			myTaskObj(String task, byte[] data) {
 				this.task = task;
 				this.data = data;
 			}
