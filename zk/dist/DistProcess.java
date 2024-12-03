@@ -45,6 +45,7 @@ public class DistProcess implements Watcher
 	ZooKeeper zk;
 	String zkServer, pinfo;
 	boolean isManager=false;
+	boolean isAssigned = false;
 
 
 	DistProcess(String zkhost)
@@ -69,6 +70,7 @@ public class DistProcess implements Watcher
 	void newWorker() throws UnknownHostException, KeeperException, InterruptedException {
 		// Worker node is ephemeral as it must be removed if the worker disconnects.
 		zk.create("/dist20/workers/" + pinfo, "Idle".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL);
+		// New worker starts off without any tasks assigned to it
 		zk.create("/dist20/assigned/" + pinfo, "".getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
 	}
 
@@ -134,6 +136,9 @@ public class DistProcess implements Watcher
 	ChildrenCallback tasksGetChildrenCallback = new ChildrenCallback() {
 		public void processResult(int rc, String path, Object ctx, List<String> children){
 			for (String c : children) zk.getData(path + "/" + c, false, getDataCallback, c);
+
+			// reset isAssigned
+			isAssigned = false;
 		}
 	};
 
@@ -164,25 +169,38 @@ public class DistProcess implements Watcher
 				String childPath = path + "/" + c;
 
 				// Get worker's data in the child path
-				zk.getData(childPath, false, getWorkerDataCallback, (myTaskObj)ctx);
+				if (!isAssigned) zk.getData(childPath, false, getWorkerDataCallback, (myTaskObj)ctx);
+				else break;
 			}
+			
 		}
 	};
-
 
 	DataCallback getWorkerDataCallback = new DataCallback() {
-		public void processResult(int rc, String path, Object ctx, byte[] data, Stat stat)  {
-			String s = new String(data, StandardCharsets.UTF_8);
-
+		public void processResult(int rc, String path, Object ctx, byte[] data, Stat stat) {
+			try{
+			String workerStatus = new String(data, StandardCharsets.UTF_8);
 			myTaskObj taskObj = (myTaskObj) ctx;
 
-			// Ensure that the worker is idling
-			if (taskObj.workerPath == null && s.equals("Idle")) {
+			// Ensure that the worker is idle and task is not already assigned
+			if (taskObj.workerPath == null && workerStatus.equals("Idle") && !isAssigned) {
+				// Assign the task atomically
 				taskObj.newWorkerAndPath(path);
 				zk.create("/dist20/assigned/" + taskObj.workerName + "/" + taskObj.task, taskObj.data, Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL, recreateTaskCallback, taskObj);
+
+				// Set the worker's status to busy
+				zk.setData("/dist20/workers/" + taskObj.workerName, taskObj.task.getBytes(), -1);
+
+				// Set isAssigned to true
+				isAssigned = true;
+
 			}
+		}catch (KeeperException ke){System.out.println("getWorkerDataCallback: " + ke);}
+		catch (InterruptedException ie){System.out.println("getWorkerDataCallback: " + ie);}
+
 		}
 	};
+	
 
 	StringCallback recreateTaskCallback = new StringCallback() {
 		public void processResult(int rc, String path, Object ctx, String name) {
@@ -205,33 +223,72 @@ public class DistProcess implements Watcher
 
 
 	void ComputeData(byte[] taskSerial, String task, String path) {
+		final byte[] finalTaskSerial = taskSerial;
+		// Create a seperate thread to perform computation
+		Thread thread = new Thread(
+			() -> {
+				// Re-construct our task object.
+				try {
+					ByteArrayInputStream bis = new ByteArrayInputStream(finalTaskSerial);
+					ObjectInput in = new ObjectInputStream(bis);
+					DistTask dt = (DistTask) in.readObject();
+
+					// Execute the task.
+					// TODO: Create a seperate thread that does the time consuming "work" and notify thread from here
+					dt.compute();
+
+					// Serialize our Task object back to a byte array!
+					ByteArrayOutputStream bos = new ByteArrayOutputStream();
+					ObjectOutputStream oos = new ObjectOutputStream(bos);
+					oos.writeObject(dt); oos.flush();
+					byte[] newTaskSerial = bos.toByteArray();
+					// finalTaskSerial = bos.toByteArray();
+
+					// Store it inside the result node.
+					zk.delete(path, -1);
+					zk.create("/dist20/tasks/"+task+"/result", newTaskSerial, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+					zk.setData("/dist20/workers/" + pinfo, "Idle".getBytes(), -1);
+					//zk.create("/dist20/tasks/"+c+"/result", ("Hello from "+pinfo).getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+
+
+				}
+				catch(NodeExistsException nee){System.out.println(nee);}
+				catch(KeeperException ke){System.out.println("ComputeData(): " + ke);}
+				catch(InterruptedException ie){System.out.println(ie);}
+				catch(IOException io){System.out.println(io);}
+				catch(ClassNotFoundException cne){System.out.println(cne);}
+			}
+
+		);
+
+		thread.start();
 		// Re-construct our task object.
-		try {
-			ByteArrayInputStream bis = new ByteArrayInputStream(taskSerial);
-			ObjectInput in = new ObjectInputStream(bis);
-			DistTask dt = (DistTask) in.readObject();
+		// try {
+		// 	ByteArrayInputStream bis = new ByteArrayInputStream(taskSerial);
+		// 	ObjectInput in = new ObjectInputStream(bis);
+		// 	DistTask dt = (DistTask) in.readObject();
 
-			// Execute the task.
-			// TODO: Create a seperate thread that does the time consuming "work" and notify thread from here
-			dt.compute();
+		// 	// Execute the task.
+		// 	// TODO: Create a seperate thread that does the time consuming "work" and notify thread from here
+		// 	dt.compute();
 
-			// Serialize our Task object back to a byte array!
-			ByteArrayOutputStream bos = new ByteArrayOutputStream();
-			ObjectOutputStream oos = new ObjectOutputStream(bos);
-			oos.writeObject(dt); oos.flush();
-			taskSerial = bos.toByteArray();
+		// 	// Serialize our Task object back to a byte array!
+		// 	ByteArrayOutputStream bos = new ByteArrayOutputStream();
+		// 	ObjectOutputStream oos = new ObjectOutputStream(bos);
+		// 	oos.writeObject(dt); oos.flush();
+		// 	taskSerial = bos.toByteArray();
 
-			// Store it inside the result node.
-			zk.delete(path, -1);
-			zk.create("/dist20/tasks/"+task+"/result", taskSerial, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-			zk.setData("/dist20/workers/" + pinfo, "Idle".getBytes(), -1);
-			//zk.create("/dist20/tasks/"+c+"/result", ("Hello from "+pinfo).getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-		}
-		catch(NodeExistsException nee){System.out.println(nee);}
-		catch(KeeperException ke){System.out.println(ke);}
-		catch(InterruptedException ie){System.out.println(ie);}
-		catch(IOException io){System.out.println(io);}
-		catch(ClassNotFoundException cne){System.out.println(cne);}
+		// 	// Store it inside the result node.
+		// 	zk.delete(path, -1);
+		// 	zk.create("/dist20/tasks/"+task+"/result", taskSerial, Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		// 	zk.setData("/dist20/workers/" + pinfo, "Idle".getBytes(), -1);
+		// 	//zk.create("/dist20/tasks/"+c+"/result", ("Hello from "+pinfo).getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		// }
+		// catch(NodeExistsException nee){System.out.println(nee);}
+		// catch(KeeperException ke){System.out.println(ke);}
+		// catch(InterruptedException ie){System.out.println(ie);}
+		// catch(IOException io){System.out.println(io);}
+		// catch(ClassNotFoundException cne){System.out.println(cne);}
 	}
 
 
